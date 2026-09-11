@@ -80,6 +80,11 @@ def run(
     if name_filter:
         manifests = [m for m in manifests if name_filter in m.name]
 
+    # Used to pick a per-runner screen_image golden (goldens/<runner_name>/<file>)
+    # when the shared default golden doesn't match this runner's native
+    # resolution/rendering. E.g. "cpc-runner-amspirit" -> "amspirit".
+    runner_name = runner_path.stem.removeprefix("cpc-runner-")
+
     if not manifests:
         click.echo("no manifests found", err=True)
         sys.exit(2)
@@ -96,7 +101,7 @@ def run(
             artefact_dir = out_dir / slug
             try:
                 artefacts = invoke(runner_path, m, artefact_dir)
-                outcomes = evaluate(m, artefacts, bless=bless)
+                outcomes = evaluate(m, artefacts, bless=bless, runner_name=runner_name)
                 results.append(TestResult(m, None, outcomes))
             except RunnerError as e:
                 results.append(TestResult(m, str(e), []))

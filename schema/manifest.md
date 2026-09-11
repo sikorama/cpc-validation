@@ -57,3 +57,17 @@ Paths inside a manifest are resolved relative to the manifest file.
 `screen_image` verdicts may be (re)blessed with `cpc-validation run --bless`.
 This overwrites the `golden` PNG with the runner's actual output. Use after
 intentional behaviour changes.
+
+## Per-runner goldens
+
+Different emulators render at different native resolutions, so a single
+`golden` image can't be shared across runners. The harness derives a
+runner name from the `--runner` binary's filename (stripping a
+`cpc-runner-` prefix if present, e.g. `cpc-runner-amspirit` -> `amspirit`)
+and looks for `<golden's dir>/<runner_name>/<golden's filename>` first,
+falling back to the plain `golden` path if no such file exists yet.
+`--bless` always writes to the per-runner path, never to the shared
+default, so blessing one runner's goldens never clobbers another's.
+
+Example: a manifest declaring `golden = "goldens/boot.png"` resolves, for
+the `amspirit` runner, to `goldens/amspirit/boot.png` if present.

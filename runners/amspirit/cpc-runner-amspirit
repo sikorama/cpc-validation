@@ -1,0 +1,590 @@
+#!/usr/bin/env python3
+"""cpc-validation runner adapter for AMSpiriT Lite (amspirit-lite-sdl).
+
+Implements the runner protocol (../../schema/runner-protocol.md) entirely by
+driving the emulator's embedded HTTP debug server
+(amspirit-lite/src/doc/web_server_api.md) -- no changes to amspirit-lite's
+C++ source are required for this adapter to work.
+
+Known limitations (MVP, see amspirit-lite/issues-to-fix.md for related bugs):
+
+  * --rom (raw ROM substitution for direct-boot exercisers) is not
+    supported: amspirit-lite only lets you pick a *named* ROM from a
+    --rom-path directory, not substitute an arbitrary file. Same gap as
+    the bundled Ronald adapter.
+
+  * `sleep`/frame budgets are counted in real emulated frames, read from
+    `emu.frames` in GET /api/ping (see wait_frames). Builds that predate
+    that field fall back to the old wall-clock approximation (N frames ~=
+    N * 20ms, valid only because the emulator is launched WITHOUT --turbo),
+    which drifts whenever emulated and real time diverge -- window mapping,
+    host load, AppImage startup. Frame *boundaries* are still not observable
+    from HTTP: waits resolve at the granularity of a poll, so this remains
+    fine for settle-and-check tests (boot banners, OCR checks) and unsuitable
+    for cycle-exact ones.
+
+  * `key_press NAME` / `key_release NAME` are collapsed into a single
+    press+release pulse on `key_press`; `key_release` is a no-op. There
+    is no HTTP primitive for an independent hold/release today. Fine for
+    the current catalog (only `key_press Enter` / `key_release Enter` is
+    used). Named keys with a keytype escape (Enter/Tab) go through
+    /api/keytype; others use /api/keypress. Both queues are now drained in
+    order (text first) by the emulator itself, and the shifted
+    CORE_rVK_MAJ_* codes work (issues-to-fix.md #2c, #3).
+
+  * ROM language is forced to EN (see the launch args below): the CPC
+    firmware nationalises typed VK codes to a printed glyph via
+    CPC_COUNTRY, so type_text output depends on --lang regardless of host
+    keyboard layout. EN gives predictable ASCII in/out. This is real CPC
+    hardware behaviour, not an amspirit-lite bug.
+
+All request bodies MUST be serialised with `compact_json()`, never
+`json.dumps()` directly -- see that function's docstring and
+issues-to-fix.md #1.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import struct
+import socket
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+# Set by main() once a free port has been picked. Deliberately NOT the
+# emulator's 6128 default: consecutive runner invocations must never be
+# able to reach a previous test's lingering instance (see pick_free_port).
+BASE_URL = ""
+FRAME_SECONDS = 1.0 / 50.0
+
+# --model / --crtc values as they appear in manifests -> amspirit-lite CLI / web API values.
+MODEL_TO_CLI = {"Cpc464": "464", "Cpc664": "664", "Cpc6128": "6128"}
+# `cpc_model` as reported by /api/state and /api/ping (0=464, 1=664, 2=6128).
+MODEL_TO_API = {"Cpc464": 0, "Cpc664": 1, "Cpc6128": 2}
+CRTC_TO_CLI = {"Type0": "0", "Type1": "1", "Type2": "2", "Type4": "4"}
+
+# CORE_rVK_* virtual key codes (amspirit-core/inc/Core_Amspirit.h) for the
+# input-script key_press/key_release directives. Extend as new named keys
+# are needed by future tests.
+VK_TABLE = {
+    "Enter": 0x92,
+    "Return": 0x92,
+    "Escape": 0x97,
+    "Tab": 0x91,
+    "Shift": 0x93,
+    "Control": 0x94,
+    "Backspace": 0x90,
+    "Delete": 0x9C,
+    "Left": 0x98,
+    "Up": 0x99,
+    "Right": 0x9A,
+    "Down": 0x9B,
+}
+
+
+class RunnerFailure(RuntimeError):
+    pass
+
+
+def workspace_root() -> Path:
+    # Expected sibling layout: <root>/cpc-validation/runners/amspirit/<this file>
+    #                          <root>/amspirit-lite/...
+    return Path(__file__).resolve().parents[3]
+
+
+def find_amspirit_binary() -> Path:
+    env = os.environ.get("AMSPIRIT_SDL_BIN")
+    if env:
+        return Path(env)
+    return (
+        workspace_root()
+        / "amspirit-lite"
+        / "src"
+        / "build"
+        / "amspirit-SDL2"
+        / "amspirit-lite-sdl"
+    )
+
+
+def find_rom_path() -> Path:
+    env = os.environ.get("AMSPIRIT_ROM_PATH")
+    if env:
+        return Path(env)
+    return workspace_root() / "amspirit-lite" / "src" / "ROMs"
+
+
+def pick_free_port() -> int:
+    """Reserve an ephemeral port for this run's emulator instance.
+
+    Using the emulator's default 6128 is unsafe here: each test spawns its
+    own instance, and a previous test's process can still hold the port
+    while the next one is starting (very visible with the AppImage, whose
+    FUSE-mounted startup and teardown are far slower than a plain binary).
+    `wait_for_server` would then get a perfectly good 200 from the WRONG
+    process and the runner would silently capture that stale instance's
+    screen/RAM -- producing a bogus PASS. Observed exactly that: a test
+    whose own emulator log stopped after 3 lines (server never started)
+    still yielded complete, plausible-looking artefacts.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def compact_json(obj) -> bytes:
+    """Serialise WITHOUT a space after ':' -- keep this for older builds.
+
+    Fixed upstream (issues-to-fix.md #1): amspirit-lite's hand-rolled body
+    parser now skips JSON whitespace on both sides of the colon, so a
+    pretty-printed body parses identically. On builds that predate the fix,
+    `json_str` matched the literal pattern `"key":"` and, unlike its
+    `json_int`/`json_bool` siblings, did not skip whitespace after the colon:
+    Python's default `json.dumps` emits `{"key": "value"}`, so every
+    string-valued field silently read back as empty -- while the endpoint
+    still answered `200 {"ok":true}`. Cheap to keep emitting compact JSON, so
+    this runner still drives released binaries correctly.
+    """
+    return json.dumps(obj, separators=(",", ":")).encode()
+
+
+def http_json(method: str, path: str, body: bytes | None = None, content_type: str | None = None):
+    req = urllib.request.Request(BASE_URL + path, data=body, method=method)
+    if body is not None and content_type:
+        req.add_header("Content-Type", content_type)
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        raw = resp.read()
+    return json.loads(raw) if raw else {}
+
+
+def wait_for_server(proc: subprocess.Popen, model: str, timeout: float = 30.0) -> None:
+    """Block until OUR emulator instance answers, or fail.
+
+    The port is unique per run (pick_free_port), so a reply can only come
+    from this process -- but we still cross-check the model it reports
+    against the model we asked for. A mismatch means we are somehow talking
+    to a different instance, which must be a hard error: silently driving
+    the wrong emulator yields confident, completely bogus verdicts.
+
+    Timeout is generous because an AppImage pays a FUSE-mount + toolkit
+    startup cost far above a plain binary's.
+    """
+    expected = MODEL_TO_API[model]
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RunnerFailure(
+                f"emulator exited early with code {proc.returncode} "
+                "(see _emu.log in the output dir)"
+            )
+        try:
+            pong = http_json("GET", "/api/ping")
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
+            time.sleep(0.1)
+            continue
+        actual = pong.get("emu", {}).get("cpc_model")
+        if actual != expected:
+            raise RunnerFailure(
+                f"server on this port reports cpc_model={actual}, expected "
+                f"{expected} for {model} -- refusing to drive an unexpected instance"
+            )
+        return
+    raise RunnerFailure("emulator web server did not come up in time")
+
+
+def frame_counter() -> int | None:
+    """Completed emulated frames, or None on builds without `emu.frames`.
+
+    `emu.frames` (GET /api/ping) is the emulator's *emulated-time* clock:
+    it is bumped once per completed video frame by the frontend's own loop.
+    Absent from builds that predate it (<= 1.14.0 releases), where every
+    caller below degrades to the old wall-clock approximation.
+    """
+    value = http_json("GET", "/api/ping").get("emu", {}).get("frames")
+    return int(value) if isinstance(value, (int, float)) else None
+
+
+def wait_frames(n: int) -> None:
+    """Block until the emulator has run `n` more EMULATED frames.
+
+    Sleeping `n * 20 ms` is not the same thing, and the difference is not
+    academic: the frontends re-pace themselves against an absolute deadline
+    and sprint to catch up after any stall (slow window mapping, host load,
+    AppImage startup), so wall-clock time and emulated time drift apart
+    exactly when a test is most fragile -- while typed characters drain from
+    the autotype queue in emulated frames, not in milliseconds.
+    """
+    if n <= 0:
+        return
+    start = frame_counter()
+    if start is None:
+        time.sleep(n * FRAME_SECONDS)  # pre-emu.frames build: best effort
+        return
+    target = start + n
+    # One sleep of the expected duration (the emulator paces at ~50 Hz), then
+    # poll for the remainder instead of hammering the server for the whole wait.
+    time.sleep(n * FRAME_SECONDS)
+    deadline = time.monotonic() + n * FRAME_SECONDS * 3 + 5.0
+    while time.monotonic() < deadline:
+        current = frame_counter()
+        if current is None or current >= target:
+            return
+        time.sleep(0.05)
+    raise RunnerFailure(
+        f"emulator ran {(frame_counter() or 0) - start} of the {n} frames "
+        "expected (paused, stalled, or dead?)"
+    )
+
+
+def wait_for_boot(timeout: float = 30.0) -> None:
+    """Block until the CPC firmware has finished drawing its boot banner.
+
+    A fixed post-`/api/ping` delay is NOT safe: the HTTP server comes up
+    before the emulation loop produces its first frame -- 1.6 s earlier on
+    the Qt AppImage (toolkit + GL + FUSE startup) versus ~0.2 s on a plain
+    SDL2 binary. Typing into a CPC that is still booting silently loses the
+    keystrokes -- which is exactly how a 60-frame guess that worked on SDL2
+    produced `"DIAG"` instead of `RUN"DIAG"` on the Qt AppImage.
+
+    Screen RAM alone cannot see that: while `frames == 0` the RAM still holds
+    its post-reset `0xFF` fill, which is both non-blank and perfectly stable,
+    so a "non-empty and unchanged" test passes on a machine whose Z80 has not
+    executed a single cycle. Hence two gates:
+
+      1. `emu.frames > 0` -- the machine is actually running;
+      2. screen RAM has *changed at least once* and then stopped changing --
+         the banner was really drawn, not merely present.
+
+    `/api/basic_state` is not usable for this -- it reports a valid-looking
+    `basic_ver`/`prog_start` from the very first frame.
+    """
+    deadline = time.monotonic() + timeout
+
+    # Gate 1: wait for the emulation loop itself.
+    while time.monotonic() < deadline:
+        frames = frame_counter()
+        if frames is None or frames > 0:
+            break
+        time.sleep(0.05)
+    else:
+        raise RunnerFailure("emulator never ran a frame (emulation loop dead?)")
+
+    # Gate 2: banner drawn, then settled.
+    previous: str | None = None
+    changed = False
+    while time.monotonic() < deadline:
+        # Mode-1 text lives in the 16 KB screen page based at 0xC000.
+        current = http_json("GET", "/api/ram?addr=0xC000&len=16384").get("hex", "")
+        if previous is not None and current != previous:
+            changed = True
+        elif changed and current == previous:
+            return
+        previous = current
+        wait_frames(10)
+    raise RunnerFailure("CPC did not reach a settled boot screen in time")
+
+
+def send_media(path: Path, drive: int) -> None:
+    """Insert a disk image at runtime via POST /api/media.
+
+    Only used for drive B: drive A is passed on the emulator's command
+    line instead (see main), which works on every build. /api/media is a
+    recent addition -- it is absent from the released 1.13.4 binaries
+    (and from git HEAD at the time of writing), where this returns 404.
+    """
+    data = path.read_bytes()
+    url = f"/api/media?name={path.name}&drive={drive}"
+    req = urllib.request.Request(BASE_URL + url, data=data, method="POST")
+    req.add_header("Content-Type", "application/octet-stream")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise RunnerFailure(
+                "POST /api/media returned 404: this emulator build predates the "
+                "endpoint (absent from released 1.13.4). Drive B requires a build "
+                "that has it; drive A does not (it is passed on the command line)."
+            ) from e
+        raise
+
+
+def send_keytype(text: str) -> None:
+    http_json("POST", "/api/keytype", compact_json({"text": text}), "application/json")
+
+
+def wait_typed(timeout: float = 30.0) -> int:
+    """Block until the emulator reports it has finished typing.
+
+    `emu.autotyping` (GET /api/ping) is true from the moment a /api/keytype or
+    /api/keypress request returns until the last character has been delivered, so
+    this replaces guessing a frame budget from the string length -- which was
+    never right: a character costs 4 frames, 5 shifted, and 9 when the next one is
+    identical. Returns the emulated frames the typing took (0 on builds without
+    the field, where the caller's budget is all we have).
+    """
+    start = frame_counter()
+    if start is None or "autotyping" not in http_json("GET", "/api/ping").get("emu", {}):
+        return 0
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not http_json("GET", "/api/ping")["emu"]["autotyping"]:
+            return (frame_counter() or start) - start
+        time.sleep(0.05)
+    raise RunnerFailure("emulator never finished typing")
+
+
+def send_keypress(vk: int) -> None:
+    http_json("POST", "/api/keypress", compact_json({"vk": vk}), "application/json")
+
+
+# Named keys that have a /api/keytype escape sequence. These are routed
+# through keytype rather than /api/keypress so they land in the SAME
+# autotype queue as any preceding type_text -- appended, not restarted
+# (web_dispatch.cpp checks autotype_index >= 0) -- which keeps them
+# strictly ordered after the text instead of racing it via the separate
+# vk_key_queue (issues-to-fix.md #2).
+KEYTYPE_EQUIVALENT = {
+    "Enter": "\r",
+    "Return": "\r",
+    "Tab": "\t",
+}
+
+
+def run_input_script(path: Path) -> int:
+    """Returns the approximate number of frames consumed by the script."""
+    frames_used = 0
+    pending_press: str | None = None
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("sleep "):
+            n = int(line.split(None, 1)[1])
+            wait_frames(n)
+            frames_used += n
+        elif line.startswith("type_text "):
+            text = line.split(None, 1)[1].replace("\\n", "\r")
+            send_keytype(text)
+            # Wait for the machine to report the text delivered, rather than
+            # budgeting frames from its length (issues-to-fix.md #2b). Falls back
+            # to the old generous budget on builds without emu.autotyping.
+            typed = wait_typed()
+            if typed:
+                frames_used += typed
+            else:
+                budget = len(text) * 10 + 20
+                wait_frames(budget)
+                frames_used += budget
+        elif line.startswith("key_press "):
+            name = line.split(None, 1)[1]
+            escape = KEYTYPE_EQUIVALENT.get(name)
+            if escape is not None:
+                # Route through the SAME autotype queue as any preceding
+                # type_text (appended, not restarted, per
+                # web_dispatch.cpp's autotype_index >= 0 check) instead of
+                # the independent vk_key_queue -- avoids racing a still-
+                # in-progress type_text (issues-to-fix.md #2).
+                send_keytype(escape)
+                typed = wait_typed()
+                frames_used += typed if typed else 20
+                if not typed:
+                    wait_frames(20)
+            else:
+                vk = VK_TABLE.get(name)
+                if vk is None:
+                    print(f"cpc-runner-amspirit: unknown key {name!r}, ignoring", file=sys.stderr)
+                    continue
+                send_keypress(vk)
+                wait_typed()  # VK presses are drained after any pending text
+            pending_press = name
+        elif line.startswith("key_release "):
+            name = line.split(None, 1)[1]
+            if name != pending_press:
+                print(
+                    f"cpc-runner-amspirit: key_release {name!r} without matching "
+                    "key_press, ignoring",
+                    file=sys.stderr,
+                )
+            pending_press = None
+        else:
+            print(f"cpc-runner-amspirit: unknown input directive {line!r}", file=sys.stderr)
+    return frames_used
+
+
+def take_screenshot(output_dir: Path) -> None:
+    # GET /api/screenshot returns the framebuffer as a PNG directly -- no Lua
+    # needed. This endpoint exists (src/amspirit-helpers/src/web_handle.cpp)
+    # but is undocumented in src/doc/web_server_api.md (see issues-to-fix.md).
+    # crop=1: visible screen area only (not the full physical buffer).
+    # full=1&live=0: the plain settled frame, not the in-progress composite.
+    url = BASE_URL + "/api/screenshot?crop=1&full=1&live=0"
+    with urllib.request.urlopen(url, timeout=5) as resp:
+        png = resp.read()
+    (output_dir / "screen.png").write_bytes(png)
+
+
+def dump_ram(model: str) -> bytes:
+    def read_bank(bank: int, length: int) -> bytes:
+        resp = http_json("GET", f"/api/ram?addr=0&len={length}&bank={bank}")
+        return bytes.fromhex(resp["hex"])
+
+    ram = read_bank(0, 65536)
+    if model == "Cpc6128":
+        ram += read_bank(1, 65536)
+    return ram
+
+
+def png_dimensions(path: Path) -> tuple[int, int]:
+    with path.open("rb") as f:
+        header = f.read(24)
+    return struct.unpack(">II", header[16:24])
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", required=True, choices=sorted(MODEL_TO_CLI))
+    ap.add_argument("--crtc", required=True, choices=sorted(CRTC_TO_CLI))
+    ap.add_argument("--frames", required=True, type=int)
+    ap.add_argument("--output-dir", required=True, type=Path)
+    ap.add_argument("--disk-a", type=Path)
+    ap.add_argument("--disk-b", type=Path)
+    ap.add_argument("--rom", type=Path)
+    ap.add_argument("--input", type=Path)
+    args = ap.parse_args()
+
+    if args.rom is not None:
+        print("cpc-runner-amspirit: --rom not yet supported by this adapter", file=sys.stderr)
+        return 2
+
+    output_dir = args.output_dir.resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    binary = find_amspirit_binary()
+    if not binary.exists():
+        print(f"cpc-runner-amspirit: binary not found at {binary}", file=sys.stderr)
+        return 2
+
+    rom_path = find_rom_path()
+    if not rom_path.exists():
+        print(f"cpc-runner-amspirit: ROM path not found at {rom_path}", file=sys.stderr)
+        return 2
+
+    env = dict(os.environ)
+    # 'offscreen' gets a real GL context without a display; 'dummy' aborts
+    # at SDL_CreateWindow (issues-to-fix.md #7). Set
+    # AMSPIRIT_RUNNER_WINDOWED=1 to run in a real visible window instead
+    # (needs a display) -- handy for watching a test drive the emulator.
+    if os.environ.get("AMSPIRIT_RUNNER_WINDOWED") != "1":
+        env["SDL_VIDEODRIVER"] = "offscreen"
+
+    global BASE_URL
+    port = pick_free_port()
+    BASE_URL = f"http://127.0.0.1:{port}"
+
+    cmd = [
+        str(binary),
+        "--web-server",
+        "--web-port", str(port),
+        "--no-splash",
+        "--reset",
+        "-m", MODEL_TO_CLI[args.model],
+        "-c", CRTC_TO_CLI[args.crtc],
+        "--rom-path", str(rom_path),
+        # Force the EN ROM: /api/keytype presses host/country-independent
+        # neutral VK codes (per doc/keyboard.md, the charmap is deliberately
+        # layout-independent for ASCII), but the CPC firmware nationalises
+        # VK -> printed glyph via CPC_COUNTRY (set from --lang). Under the
+        # default "FR" ROM, type_text output can be the wrong glyph
+        # (verified: the same VK sequence renders correctly on EN and
+        # garbled on FR). That is real CPC per-country keyboard behaviour,
+        # not an amspirit-lite bug -- pinning EN just gives the runner
+        # protocol's host-independent `type_text` one predictable target.
+        # --keyboard (host layout) is irrelevant on this HTTP path.
+        "-l", "EN",
+    ]
+    # Drive A goes on the command line (as the trailing positional FILE)
+    # rather than through POST /api/media: the CLI works on every build,
+    # including released ones where /api/media does not exist yet, and it
+    # matches a disk physically sitting in the drive at power-on. Drive B
+    # has no CLI equivalent, so it still needs the API.
+    if args.disk_a is not None:
+        cmd.append(str(args.disk_a.resolve()))
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=output_dir,  # keep any stray files the emulator writes contained
+        env=env,
+        # Kept as a file (not DEVNULL): useful when diagnosing a run after
+        # the fact -- e.g. ROM load errors, or add --debug-webapi manually
+        # above to see every request/response the server handled.
+        stdout=open(output_dir / "_emu.log", "wb"),
+        stderr=subprocess.STDOUT,
+    )
+
+    exit_reason = "frames_complete"
+    ram = b""
+    screen_mode = -1
+    input_frames = 0
+    try:
+        wait_for_server(proc, args.model)
+        # The HTTP server answers long before the emulated ROM is ready;
+        # wait for the machine itself, not for a guessed delay.
+        wait_for_boot()
+
+        # disk_a was already inserted via the command line (see cmd above).
+        if args.disk_b is not None:
+            send_media(args.disk_b, drive=1)
+
+        if args.input is not None:
+            input_frames = run_input_script(args.input)
+
+        wait_frames(args.frames)
+
+        take_screenshot(output_dir)
+        ram = dump_ram(args.model)
+        state = http_json("GET", "/api/state")
+        screen_mode = state["ga"]["mode"]
+    except Exception as e:  # noqa: BLE001 - reported via meta.json + non-zero exit
+        exit_reason = f"error: {e}"
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=5)
+
+    if exit_reason != "frames_complete":
+        print(f"cpc-runner-amspirit: {exit_reason}", file=sys.stderr)
+        return 1
+
+    (output_dir / "ram.bin").write_bytes(ram)
+
+    screen_path = output_dir / "screen.png"
+    if not screen_path.exists():
+        print("cpc-runner-amspirit: screenshot missing after script completion", file=sys.stderr)
+        return 1
+    width, height = png_dimensions(screen_path)
+
+    meta = {
+        "model": args.model,
+        "crtc": args.crtc,
+        "frames_run": input_frames + args.frames,
+        "exit": exit_reason,
+        "ram_size": len(ram),
+        "screen_mode": screen_mode,
+        "screen": {"width": width, "height": height},
+    }
+    (output_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

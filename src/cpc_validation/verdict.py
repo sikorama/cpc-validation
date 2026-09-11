@@ -25,8 +25,9 @@ def evaluate(
     manifest: Manifest,
     artefacts: RunArtefacts,
     bless: bool = False,
+    runner_name: str | None = None,
 ) -> list[VerdictOutcome]:
-    return [_evaluate_one(manifest, v, artefacts, bless) for v in manifest.verdicts]
+    return [_evaluate_one(manifest, v, artefacts, bless, runner_name) for v in manifest.verdicts]
 
 
 def _evaluate_one(
@@ -34,6 +35,7 @@ def _evaluate_one(
     verdict: Verdict,
     artefacts: RunArtefacts,
     bless: bool,
+    runner_name: str | None,
 ) -> VerdictOutcome:
     try:
         match verdict.kind:
@@ -42,7 +44,7 @@ def _evaluate_one(
             case "ram_hash":
                 return _ram_hash(verdict, artefacts)
             case "screen_image":
-                return _screen_image(manifest, verdict, artefacts, bless)
+                return _screen_image(manifest, verdict, artefacts, bless, runner_name)
             case "screen_text_contains":
                 return _screen_text_contains(verdict, artefacts)
             case "screen_text_regex":
@@ -93,12 +95,24 @@ def _screen_image(
     verdict: Verdict,
     artefacts: RunArtefacts,
     bless: bool,
+    runner_name: str | None,
 ) -> VerdictOutcome:
     golden_str = verdict.params.get("golden")
     if not isinstance(golden_str, str):
         return VerdictOutcome(verdict, False, "screen_image.golden is required")
     golden_path: Path = manifest.resolve(golden_str)
     tolerance = float(verdict.params.get("tolerance", 0.0))
+
+    # Different emulators render at different native resolutions, so a single
+    # shared golden can't work across runners. When a runner name is known,
+    # look for (and always bless to) a per-runner golden alongside the
+    # default one: goldens/<file> -> goldens/<runner_name>/<file>. Falls back
+    # to the shared default when no per-runner golden exists yet, so existing
+    # manifests/goldens need no changes.
+    if runner_name:
+        per_runner_path = golden_path.parent / runner_name / golden_path.name
+        if bless or per_runner_path.exists():
+            golden_path = per_runner_path
 
     if bless or not golden_path.exists():
         golden_path.parent.mkdir(parents=True, exist_ok=True)
